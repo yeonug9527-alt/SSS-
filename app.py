@@ -71,6 +71,36 @@ def expanded_trade_stats(trades: pd.DataFrame) -> dict:
             if "Total_Cost" in x else np.nan,
     }
 
+def add_stock_names(df, master):
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    out=df.copy()
+    if master is not None and not master.empty and "Symbol" in master.columns and "Name" in master.columns:
+        mp=dict(zip(master["Symbol"].astype(str),master["Name"].astype(str)))
+        out["Name"]=out["Symbol"].astype(str).map(mp).fillna(out["Symbol"].astype(str))
+        cols=out.columns.tolist(); out=out[[c for c in ["Name","Symbol"] if c in cols]+[c for c in cols if c not in {"Name","Symbol"}]]
+    return out
+
+def korean_trade_table(df, master=None):
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    x=add_stock_names(df,master)
+    mp={"Name":"종목명","Symbol":"종목코드","Position_ID":"거래번호","Entry_Date":"진입일","Exit_Date":"청산일","Initial_Qty":"초기수량","Action_Qty":"매도수량","Remaining_Qty":"남은수량","Holding_Days":"보유일수","Entry_Price":"진입가격","Exit_Price":"청산가격","Eval_Price":"현재평가가격","Gross_PnL":"매매손익","Buy_Fee_Allocated":"매수수수료","Sell_Fee":"매도수수료","Sell_Tax":"거래세","Net_PnL":"순손익","Realized_PnL":"실현손익","Realized_Total_PnL":"총실현손익","Unrealized_Net_PnL":"미실현손익","Net_PnL_Pct_On_Sold_Cost":"순수익률","Exit_Reason":"청산사유","Signal_Date":"신호일","Signal_ATR":"신호일 ATR","EntryGapPct":"진입갭","SignalRegime":"신호 당시 시장상태","SignalYear":"신호연도","Date":"날짜","Type":"거래구분","Price":"가격","Reason":"사유","ReservedReleased":"반환된 예약금"}
+    return x.rename(columns={k:v for k,v in mp.items() if k in x.columns})
+
+def recommendation_risk_levels(row):
+    try:
+        entry=float(row.get("Close",np.nan)); atr=float(row.get("ATR14",np.nan))
+        if not (np.isfinite(entry) and entry>0 and np.isfinite(atr) and atr>0): return None
+        stop=entry-2.0*atr; risk=entry-stop; tp1=entry+2.0*risk; tp2=entry+3.5*risk
+        return {"기준 진입가":entry,"손절가":stop,"1차 익절가":tp1,"2차 익절가":tp2,"손절폭":(stop/entry-1)*100,"1차 익절폭":(tp1/entry-1)*100,"2차 익절폭":(tp2/entry-1)*100}
+    except Exception:
+        return None
+
+def backtest_glossary():
+    g=pd.DataFrame([["최종 자산","마지막 날 현금 + 보유주식 평가액"],["누적 수익률","초기자본 대비 최종 자산의 증가·감소율"],["연평균 수익률(CAGR)","전체 기간 수익을 연간 기준으로 환산한 값"],["최대 낙폭(MDD)","고점 대비 가장 크게 떨어진 폭. 작을수록 좋음"],["실현 승률","완전히 청산된 거래 중 수익 거래 비율"],["수익/손실 비율(PF)","전체 이익 ÷ 전체 손실. 1보다 크면 이익이 손실보다 큼"],["Sharpe","일별 변동성 대비 수익의 정도"],["Sortino","하락 변동성만 위험으로 본 수익 대비 위험 지표"],["예약금","다음날 매수를 위해 따로 확보한 현금"],["미실현 손익","아직 팔지 않은 주식의 평가손익. 실현 승률에는 제외"],["신호일","매수 조건을 판단한 날의 종가"],["진입일","실제 매수 체결일. 기본은 다음 거래일 시가"],["TP1 / TP2","1차 / 2차 익절 목표가"],["SL","손절가"]],columns=["용어","뜻"])
+    st.dataframe(g,use_container_width=True,hide_index=True)
+
 def calendar_walk_forward(signal_df: pd.DataFrame, train_years=2, test_years=1,
                           score_candidates=(60,65,70,75,80,85,90)):
     """Date-based WF; no splitting within a calendar day."""
@@ -1949,6 +1979,9 @@ with tab1:
                 "가격 변동 위험":round(row.get("ATR_Pct",np.nan)*100,2),
                 "시장 분위기":row.get("Regime","데이터부족"),
             })
+            risk_levels=recommendation_risk_levels(row)
+            if risk_levels:
+                rows[-1].update({k:round(v,2) for k,v in risk_levels.items()})
 
         result_df=pd.DataFrame(rows)
         st.session_state["scan_result"]=result_df
@@ -1958,7 +1991,7 @@ with tab1:
             st.warning("분석 가능한 종목이 없습니다. 분석 종목 수를 늘리거나 조건을 완화해 보세요.")
         else:
             st.subheader("🏆 오늘의 상위 후보")
-            st.caption("최종점수는 종목 자체의 상승 구조, 내일 진입 적합성, 과거 유사상황의 실제 상승 결과를 함께 반영합니다.")
+            st.caption("종목명·종목코드와 함께 기준 진입가·손절가·1차/2차 익절가를 보여줍니다. 기준 진입가는 신호일 종가이며 실제 매수는 기본적으로 다음 거래일 시가입니다.")
 
             top=result_df.head(20).copy()
             st.dataframe(
@@ -1970,6 +2003,13 @@ with tab1:
                     "상승 가능성":st.column_config.NumberColumn(format="%.1f"),
                     "과거 5일 상승비율":st.column_config.NumberColumn(format="%.1f%%"),
                     "거래량":st.column_config.NumberColumn(format="%.2f배"),
+                    "기준 진입가":st.column_config.NumberColumn(format="%d원"),
+                    "손절가":st.column_config.NumberColumn(format="%d원"),
+                    "1차 익절가":st.column_config.NumberColumn(format="%d원"),
+                    "2차 익절가":st.column_config.NumberColumn(format="%d원"),
+                    "손절폭":st.column_config.NumberColumn(format="%+.2f%%"),
+                    "1차 익절폭":st.column_config.NumberColumn(format="%+.2f%%"),
+                    "2차 익절폭":st.column_config.NumberColumn(format="%+.2f%%"),
                 }
             )
 
@@ -1992,6 +2032,14 @@ with tab1:
                     c1.metric("종목 자체",f"{score['QualityScore']:.1f}")
                     c2.metric("내일 진입",f"{score['EntryScore']:.1f}")
                     c3.metric("상승 가능성",f"{score['RisePotentialScore']:.1f}")
+                    risk_levels=recommendation_risk_levels(row)
+                    if risk_levels:
+                        r1,r2,r3,r4=st.columns(4)
+                        r1.metric("기준 진입가",f"{risk_levels['기준 진입가']:,.0f}원")
+                        r2.metric("손절가",f"{risk_levels['손절가']:,.0f}원",f"{risk_levels['손절폭']:+.2f}%")
+                        r3.metric("1차 익절가",f"{risk_levels['1차 익절가']:,.0f}원",f"{risk_levels['1차 익절폭']:+.2f}%")
+                        r4.metric("2차 익절가",f"{risk_levels['2차 익절가']:,.0f}원",f"{risk_levels['2차 익절폭']:+.2f}%")
+                        st.caption("※ 실제 다음날 시가가 기준 진입가와 달라도 백테스트는 신호일 기준 손절/익절 가격을 고정합니다.")
                     st.markdown("**추천 이유**")
                     for reason in rec["추천이유"]:
                         st.write("✅ "+reason)
@@ -2138,22 +2186,25 @@ with tab3:
     if "bt" in st.session_state:
         r=st.session_state["bt"]; m=r["meta"]
         st.info(f"사용 최소점수 {m.get('used_min_score','-')} | 유니버스 {m['universe_label']} | 요청 {m['requested_symbols']} | 성공 {m['loaded_symbols']}")
+        st.caption("읽는 순서: ① 최종 자산·누적 수익률 → ② 최대 낙폭(MDD) → ③ 실현 승률·수익/손실 비율 → ④ 거래내역의 종목명·종목코드·진입/청산 가격")
         cols=st.columns(10)
         vals=[("최종 자산",f"{m['final_asset']:,.0f}"),("누적 수익률",f"{m['total_return']:+.2f}%"),("연평균 수익률",f"{m['cagr']:+.2f}%"),
               ("최대 낙폭",f"{m['mdd']:.2f}%"),("실현 승률",f"{m['win_rate']:.1f}%"),("수익/손실 비율",f"{m['profit_factor']:.2f}"),
               ("위험 대비 수익",f"{m['sharpe']:.2f}"),("하락 위험 대비 수익",f"{m['sortino']:.2f}"),("최대 연속 손실",str(m["max_consecutive_losses"])),("아직 끝나지 않은 거래",str(m["open_positions"]))]
         for c,(lab,val) in zip(cols,vals):c.metric(lab,val)
-        st.subheader("자산곡선"); st.line_chart(r["portfolio"].set_index("Date")["TotalAsset"])
-        st.subheader("현금 / 예약금 / 투자금"); st.line_chart(r["portfolio"].set_index("Date")[["Cash","ReservedCash","InvestedValue"]])
-        st.subheader("거래가 끝난 종목"); st.dataframe(r["closed"],use_container_width=True,hide_index=True)
-        st.subheader("아직 끝나지 않은 거래 — 실현 성과에서 제외"); st.dataframe(r["open"],use_container_width=True,hide_index=True)
+        st.subheader("📖 결과 해석 방법")
+        backtest_glossary()
+        st.subheader("자산곡선"); st.line_chart(r["portfolio"].set_index("Date")[["TotalAsset"]].rename(columns={"TotalAsset":"총자산"}))
+        st.subheader("현금 / 예약금 / 투자금"); st.line_chart(r["portfolio"].set_index("Date")[["Cash","ReservedCash","InvestedValue"]].rename(columns={"Cash":"현금","ReservedCash":"예약금","InvestedValue":"투자금"}))
+        st.subheader("📋 거래가 끝난 종목"); st.caption("종목명과 종목코드를 같이 표시합니다."); st.dataframe(korean_trade_table(r["closed"],master),use_container_width=True,hide_index=True)
+        st.subheader("📋 아직 끝나지 않은 거래 — 실현 성과에서 제외"); st.dataframe(korean_trade_table(r["open"],master),use_container_width=True,hide_index=True)
         if not r["meta"]["gap_performance"].empty:
             st.subheader("실제 다음날 시가가 얼마나 달랐는지"); st.dataframe(r["meta"]["gap_performance"],use_container_width=True,hide_index=True)
         if not r["meta"]["regime_performance"].empty:
             st.subheader("시장 분위기별 성과"); st.dataframe(r["meta"]["regime_performance"],use_container_width=True,hide_index=True)
         if not r["meta"]["year_performance"].empty:
             st.subheader("연도별 성과"); st.dataframe(r["meta"]["year_performance"],use_container_width=True,hide_index=True)
-        st.subheader("예약금 반환/실행 실패"); st.dataframe(r["rejected"],use_container_width=True,hide_index=True)
+        st.subheader("예약금 반환 / 실행 실패"); st.dataframe(korean_trade_table(r["rejected"],master),use_container_width=True,hide_index=True)
 
 with tab4:
     st.header("🧪 기대값 + 상위 5/10/20% 비교 + 진짜 워크포워드")
