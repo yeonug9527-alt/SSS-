@@ -1879,13 +1879,39 @@ with tab1:
             )
 
             st.subheader("🟢 왜 이 종목인가?")
-            for r in top.head(5).itertuples(index=False):
-                detail=st.session_state["scan_details"].get(r.종목코드)
-                if not detail:
-                    continue
-                row,score,passed,reasons,name=detail
-                rec=recommendation_summary(row,score,passed,reasons,s["min_score"])
-                title=f"{r.당일_순위}위 · {name} · {rec['판단']} · {r.상승_패턴} · 최종 {score['TotalScore']:.1f}"
+
+for _, r in top.head(5).iterrows():
+    symbol = str(r.get("종목코드", "")).strip()
+    detail = st.session_state["scan_details"].get(symbol)
+
+    if not detail:
+        continue
+
+    row, score, passed, reasons, name = detail
+
+    rec = recommendation_summary(
+        row,
+        score,
+        passed,
+        reasons,
+        s["min_score"]
+    )
+
+    rank_value = r.get("당일 순위", 0)
+    if pd.isna(rank_value):
+        rank = 0
+    else:
+        rank = int(rank_value)
+
+    pattern = str(r.get("상승 패턴", "관찰형"))
+
+    title = (
+        f"{rank}위 · {name} · "
+        f"{rec['판단']} · {pattern} · "
+        f"최종 {score['TotalScore']:.1f}"
+    )
+
+    with st.expander(title, expanded=(rank == 1)):
                 with st.expander(title,expanded=(r.당일_순위==1)):
                     c1,c2,c3=st.columns(3)
                     c1.metric("종목 자체",f"{score['QualityScore']:.1f}")
