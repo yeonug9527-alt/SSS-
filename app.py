@@ -1879,14 +1879,20 @@ with tab1:
             )
 
             st.subheader("🟢 왜 이 종목인가?")
-            for r in top.head(5).itertuples(index=False):
-                detail=st.session_state["scan_details"].get(r.종목코드)
+            # DataFrame의 한글 컬럼명을 itertuples() 속성으로 접근하면
+            # pandas 버전에 따라 필드명이 달라져 AttributeError가 날 수 있다.
+            # Series의 명시적 컬럼명 접근으로 고정한다.
+            for _, r in top.head(5).iterrows():
+                sym_key = r["종목코드"]
+                detail=st.session_state["scan_details"].get(sym_key)
                 if not detail:
                     continue
                 row,score,passed,reasons,name=detail
                 rec=recommendation_summary(row,score,passed,reasons,s["min_score"])
-                title=f"{r.당일_순위}위 · {name} · {rec['판단']} · {r.상승_패턴} · 최종 {score['TotalScore']:.1f}"
-                with st.expander(title,expanded=(r.당일_순위==1)):
+                rank_value = r["당일 순위"]
+                pattern_value = r["상승 패턴"]
+                title=f"{rank_value}위 · {name} · {rec['판단']} · {pattern_value} · 최종 {score['TotalScore']:.1f}"
+                with st.expander(title,expanded=(rank_value==1)):
                     c1,c2,c3=st.columns(3)
                     c1.metric("종목 자체",f"{score['QualityScore']:.1f}")
                     c2.metric("내일 진입",f"{score['EntryScore']:.1f}")
