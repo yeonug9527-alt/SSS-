@@ -346,6 +346,68 @@ def calculate_indicators(raw, market_close=None, market_data=None):
     df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False, min_periods=9).mean()
     df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
 
+    # 영상에서 보이는 복합 신호를 재현하기 위한 보조 지표.
+    # 원본 영상의 비공개 소스코드를 알 수 없으므로 표준 정의를 사용한다.
+    median_price = (h + l) / 2.0
+    df["AwesomeOscillator"] = (
+        median_price.rolling(5, min_periods=5).mean()
+        - median_price.rolling(34, min_periods=34).mean()
+    )
+    df["Momentum10"] = c - c.shift(10)
+    df["ROC10"] = c.pct_change(10) * 100
+
+    # 표준 SuperTrend(ATR 10, multiplier 3.0)
+    st_period = 10
+    st_mult = 3.0
+    st_atr = wilder_atr(df, st_period)
+    hl2 = (h + l) / 2.0
+    basic_upper = hl2 + st_mult * st_atr
+    basic_lower = hl2 - st_mult * st_atr
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    for j in range(1, len(df)):
+        if pd.isna(st_atr.iloc[j]):
+            continue
+        prev_close = c.iloc[j - 1]
+        prev_fu = final_upper.iloc[j - 1]
+        prev_fl = final_lower.iloc[j - 1]
+        final_upper.iloc[j] = (
+            basic_upper.iloc[j]
+            if pd.isna(prev_fu) or basic_upper.iloc[j] < prev_fu or prev_close > prev_fu
+            else prev_fu
+        )
+        final_lower.iloc[j] = (
+            basic_lower.iloc[j]
+            if pd.isna(prev_fl) or basic_lower.iloc[j] > prev_fl or prev_close < prev_fl
+            else prev_fl
+        )
+    supertrend = pd.Series(np.nan, index=df.index, dtype=float)
+    supertrend_dir = pd.Series(0, index=df.index, dtype=int)
+    for j in range(1, len(df)):
+        if pd.isna(st_atr.iloc[j]):
+            continue
+        prev_st = supertrend.iloc[j - 1]
+        if pd.isna(prev_st):
+            supertrend.iloc[j] = final_upper.iloc[j] if c.iloc[j] <= final_upper.iloc[j] else final_lower.iloc[j]
+            supertrend_dir.iloc[j] = -1 if c.iloc[j] <= final_upper.iloc[j] else 1
+        elif prev_st == final_upper.iloc[j - 1]:
+            if c.iloc[j] <= final_upper.iloc[j]:
+                supertrend.iloc[j] = final_upper.iloc[j]
+                supertrend_dir.iloc[j] = -1
+            else:
+                supertrend.iloc[j] = final_lower.iloc[j]
+                supertrend_dir.iloc[j] = 1
+        else:
+            if c.iloc[j] >= final_lower.iloc[j]:
+                supertrend.iloc[j] = final_lower.iloc[j]
+                supertrend_dir.iloc[j] = 1
+            else:
+                supertrend.iloc[j] = final_upper.iloc[j]
+                supertrend_dir.iloc[j] = -1
+    df["SuperTrend"] = supertrend
+    df["SuperTrendDir"] = supertrend_dir
+    df["SuperTrendBull"] = supertrend_dir > 0
+
     up_move, down_move = h.diff(), -l.diff()
     plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
     minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
@@ -356,6 +418,30 @@ def calculate_indicators(raw, market_close=None, market_data=None):
     dx = 100 * (plus_di-minus_di).abs() / (plus_di+minus_di).replace(0,np.nan)
     df["PlusDI"], df["MinusDI"] = plus_di, minus_di
     df["ADX14"] = dx.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    df["VideoLongScore"] = (
+        (df["SuperTrendDir"] > 0).astype(int)
+        + (df["PlusDI"] > df["MinusDI"]).astype(int)
+        + (df["MACD"] > df["MACD_Signal"]).astype(int)
+        + (df["AwesomeOscillator"] > 0).astype(int)
+        + (df["Momentum10"] > 0).astype(int)
+        + (df["ROC10"] > 0).astype(int)
+    )
+    df["VideoShortScore"] = (
+        (df["SuperTrendDir"] < 0).astype(int)
+        + (df["MinusDI"] > df["PlusDI"]).astype(int)
+        + (df["MACD"] < df["MACD_Signal"]).astype(int)
+        + (df["AwesomeOscillator"] < 0).astype(int)
+        + (df["Momentum10"] < 0).astype(int)
+        + (df["ROC10"] < 0).astype(int)
+    )
+    df["VideoLongSignal"] = (
+        (df["VideoLongScore"] >= 5)
+        & (df["VideoLongScore"].shift(1) < 5)
+    )
+    df["VideoShortSignal"] = (
+        (df["VideoShortScore"] >= 5)
+        & (df["VideoShortScore"].shift(1) < 5)
+    )
 
     bb_mid = c.rolling(20, min_periods=20).mean()
     bb_std = c.rolling(20, min_periods=20).std()
@@ -899,7 +985,7 @@ def close_position(pos, exit_date, exit_price, reason, qty, fee_rate, tax_rate):
 # ============================================================
 
 def run_backtest(universe_data, settings, initial_capital, max_concurrent, max_holding_days,
-                 partial_ratio, fee_rate, tax_rate, slip_rate, execution_mode):
+                 partial_ratio, fee_rate, tax_rate, slip_rate, execution_mode, progress_callback=None):
     dates = sorted(set(d for df in universe_data.values() for d in df.index))
     if len(dates) < 2:
         return None
@@ -913,8 +999,17 @@ def run_backtest(universe_data, settings, initial_capital, max_concurrent, max_h
     rejected_orders = []
     portfolio = []
 
+    total_dates = len(dates)
+    last_reported = -1
     for i, current_date in enumerate(dates):
         is_last = i == len(dates) - 1
+        # 진행률은 백테스트 날짜 처리 기준. 너무 잦은 Streamlit 갱신으로 느려지지 않도록
+        # 최대 약 100회만 화면을 갱신한다.
+        if progress_callback:
+            pct = int((i + 1) / max(total_dates, 1) * 100)
+            if pct != last_reported or is_last:
+                progress_callback(pct, current_date, i + 1, total_dates)
+                last_reported = pct
 
         # --------------------------------------------------------
         # A. Execute pending orders at current day's actual open.
@@ -1967,13 +2062,26 @@ with tab2:
                     st.markdown("### 📌 지표를 쉽게 읽는 법")
                     st.dataframe(korean_indicator_table(row,score),use_container_width=True,hide_index=True)
                     st.line_chart(tmp[["Close","EMA20","EMA60","EMA120"]].tail(250))
+                    st.subheader("🎬 영상형 복합 신호(표준 지표 기반)")
+                    video_cols=[c for c in [
+                        "SuperTrend","SuperTrendDir","AwesomeOscillator","Momentum10","ROC10",
+                        "PlusDI","MinusDI","MACD","MACD_Signal","VideoLongScore","VideoShortScore"
+                    ] if c in tmp.columns]
+                    if video_cols:
+                        vr=tmp.iloc[-1]
+                        vc1,vc2,vc3=st.columns(3)
+                        vc1.metric("LONG 점수",f"{int(vr.get('VideoLongScore',0))}/6")
+                        vc2.metric("SHORT 점수",f"{int(vr.get('VideoShortScore',0))}/6")
+                        vc3.metric("SuperTrend", "상승" if vr.get("SuperTrendDir",0)>0 else "하락")
+                        st.dataframe(tmp[video_cols].tail(20),use_container_width=True,hide_index=False)
+                        st.caption("영상의 실제 원본 수식은 확인할 수 없으므로, 화면에 표시된 DMI/AO/Momentum/ROC/MACD/SuperTrend 구조를 표준 수식으로 재구성한 연구용 신호입니다.")
 
 with tab3:
     st.header("📈 실제 포트폴리오 백테스트")
     st.warning("역사적 유니버스 CSV를 넣지 않으면 현재 KRX 종목목록을 사용하므로 생존자 편향이 남을 수 있습니다.")
     c1,c2,c3=st.columns(3)
     with c1:
-        bt_market=st.selectbox("시장",["KOSPI","KOSDAQ"],key="bt_market")
+        bt_market=st.selectbox("시장",["KOSPI","KOSDAQ","KOSPI+KOSDAQ"],key="bt_market",format_func=lambda x: {"KOSPI":"🇰🇷 코스피","KOSDAQ":"🟦 코스닥","KOSPI+KOSDAQ":"🇰🇷 코스피 + 코스닥 통합"}.get(x,x))
         years=st.slider("백테스트 기간(년)",1,8,3)
         sample=st.number_input("종목 수 (0=전체)",0,3000,100,10,key="bt_sample")
     with c2:
@@ -1992,14 +2100,39 @@ with tab3:
         start=(datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)-timedelta(days=int(years*365+300))).strftime("%Y-%m-%d")
         end=datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None).strftime("%Y-%m-%d")
         hist_u,_=load_historical_universe(hist_file)
-        with st.spinner("과거 날짜별 상대순위와 포트폴리오 회계를 계산하는 중..."):
-            data,master,failures,universe_label=build_universe(bt_market,start,end,int(sample) if sample else 0,hist_u)
-        if not data:st.error("백테스트 데이터가 없습니다.")
+        bt_progress=st.progress(0, text="백테스트 준비 중...")
+        bt_status=st.empty()
+
+        def bt_data_progress(done,total,msg):
+            pct=float(done)/max(float(total),1.0)
+            bt_progress.progress(min(pct*0.40,0.40), text=f"📥 {msg} · {pct*100:.0f}%")
+            bt_status.caption(msg)
+
+        data,master,failures,universe_label=build_universe(
+            bt_market,start,end,int(sample) if sample else 0,hist_u,
+            progress_callback=bt_data_progress
+        )
+        if not data:
+            bt_progress.progress(1.0,text="❌ 백테스트 데이터가 없습니다.")
+            bt_status.error("백테스트 데이터가 없습니다.")
+            st.error("백테스트 데이터가 없습니다.")
         else:
             bt_settings=dict(s)
             if use_wf and "wf_threshold" in st.session_state: bt_settings["min_score"]=st.session_state["wf_threshold"]
             partial_val=0.3 if partial=="30%" else 0.5 if partial=="50%" else 1.0
-            result=run_backtest(data,bt_settings,float(capital),max_concurrent,max_hold,partial_val,fee,tax,slip,"next_open" if execution=="다음날 시가" else "close")
+
+            def bt_engine_progress(pct,current_date,done,total):
+                overall=0.40 + 0.60*(pct/100.0)
+                bt_progress.progress(min(overall,1.0), text=f"📈 백테스트 계산 중 · {done:,}/{total:,}일 · {pct}%")
+                bt_status.caption(f"처리 중: {pd.Timestamp(current_date).date()} · 보유 {len(st.session_state.get('_bt_preview_positions', [])) if False else 0}건")
+
+            result=run_backtest(
+                data,bt_settings,float(capital),max_concurrent,max_hold,partial_val,
+                fee,tax,slip,"next_open" if execution=="다음날 시가" else "close",
+                progress_callback=bt_engine_progress
+            )
+            bt_progress.progress(1.0,text="✅ 백테스트 완료")
+            bt_status.success(f"백테스트 완료 · {len(data):,}개 종목 · {universe_label}")
             result["meta"].update({"universe_label":universe_label,"loaded_symbols":len(data),"requested_symbols":len(master),"failed_symbols":len(failures),"used_min_score":bt_settings["min_score"]})
             st.session_state["bt"]=result; st.session_state["bt_failures"]=failures
     if "bt" in st.session_state:
@@ -2025,17 +2158,43 @@ with tab3:
 with tab4:
     st.header("🧪 기대값 + 상위 5/10/20% 비교 + 진짜 워크포워드")
     st.caption("점수 70점 이상 같은 절대 컷 하나만 보는 대신, 당일 종목 중 상위 5%·10%·20%의 실제 선도수익을 비교합니다.")
-    rw_market=st.selectbox("연구 시장",["KOSPI","KOSDAQ"],key="rw_market")
+    rw_market=st.selectbox(
+        "연구 시장",
+        ["KOSPI","KOSDAQ","KOSPI+KOSDAQ"],
+        key="rw_market",
+        format_func=lambda x: {"KOSPI":"🇰🇷 코스피","KOSDAQ":"🟦 코스닥","KOSPI+KOSDAQ":"🇰🇷 코스피 + 코스닥 통합"}.get(x,x)
+    )
+    rw_compare_all=st.checkbox("코스피·코스닥·통합 3가지를 한 번에 비교",False)
     rw_years=st.slider("연구기간(년)",1,8,3,key="rw_years")
     rw_sample=st.number_input("연구 종목 수",0,3000,100,10,key="rw_sample")
     if st.button("🔬 신호 연구 실행",type="primary"):
         start=(datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)-timedelta(days=int(rw_years*365+350))).strftime("%Y-%m-%d")
         end=datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None).strftime("%Y-%m-%d")
-        with st.spinner("신호별 미래수익과 날짜별 상대순위를 계산하는 중..."):
-            data,master,failures,label=build_universe(rw_market,start,end,int(rw_sample) if rw_sample else 0)
-            fwd=forward_return_research(data,s)
-        st.session_state["fwd"]=fwd; st.session_state["fwd_label"]=label
-    if "fwd" in st.session_state:
+        markets_to_run=["KOSPI","KOSDAQ","KOSPI+KOSDAQ"] if rw_compare_all else [rw_market]
+        rp=st.progress(0,text="신호 연구 준비 중...")
+        rs=st.empty()
+        fwd_results={}
+        for mi,mkt in enumerate(markets_to_run,1):
+            rs.info(f"{mkt} 데이터 수집·계산 중... ({mi}/{len(markets_to_run)})")
+            data,master,failures,label=build_universe(mkt,start,end,int(rw_sample) if rw_sample else 0)
+            fwd_results[mkt]=forward_return_research(data,s)
+            rp.progress(mi/len(markets_to_run),text=f"🔬 {mkt} 신호 연구 완료 · {mi}/{len(markets_to_run)}")
+        st.session_state["fwd_results"]=fwd_results
+        st.session_state["fwd"]=fwd_results.get(rw_market,pd.DataFrame())
+        st.session_state["fwd_label"]=rw_market
+        rs.success("기대값·워크포워드 연구 완료")
+    if "fwd_results" in st.session_state and st.session_state["fwd_results"]:
+        fwd_results=st.session_state["fwd_results"]
+        compare_rows=[]
+        for mkt,fx in fwd_results.items():
+            if fx is None or fx.empty:
+                compare_rows.append({"시장":mkt,"신호수":0,"평균20일수익":np.nan,"20일승률":np.nan})
+            else:
+                z=fx["Fwd20D"].dropna()
+                compare_rows.append({"시장":mkt,"신호수":len(z),"평균20일수익":z.mean(),"20일승률":(z>0).mean()*100})
+        if len(compare_rows)>1:
+            st.subheader("📊 시장별 기대값 비교")
+            st.dataframe(pd.DataFrame(compare_rows),use_container_width=True,hide_index=True)
         fwd=st.session_state["fwd"]
         st.info(f"분석 신호 {len(fwd):,}개 | {st.session_state['fwd_label']}")
         if not fwd.empty:
@@ -2070,7 +2229,7 @@ with tab5:
         ("점수 분리","PASS","종목 자체 점수(Quality)와 내일 진입점수(Entry)를 분리 후 최종점수로 결합."),
         ("상위 5/10/20%","PASS","절대 70점 컷 외에 당일 상대순위별 실제 기대값을 비교."),
         ("워크포워드","PASS","날짜 순 train/test 분리, 학습구간에서만 기준 선택."),
-        ("실제 포트폴리오 연결","PASS","워크포워드 선택 기준을 백테스트 최소점수로 자동 연결 가능."),
+        ("실제 포트폴리오 연결","PASS","워크포워드 선택 기준을 백테스트 최소점수로 자동 연결 가능. 코스피/코스닥/통합 시장을 선택할 수 있음."),
         ("수수료 중복","PASS","매수/매도 비용은 거래 원가에 각각 1회 반영."),
         ("예약금 정산","PASS","체결·취소·슬롯 부족 시 예약금을 반환."),
         ("미청산 분리","PASS","미청산은 실현 승률/PF에서 제외하고 평가손익을 별도 표시."),
