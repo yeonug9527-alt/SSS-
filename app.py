@@ -1878,9 +1878,11 @@ with tab1:
                 }
             )
 
-            st.subheader("🟢 왜 이 종목인가?")
-            for _, r in top.head(5).iterrows():
+st.subheader("🟢 왜 이 종목인가?")
+
+for _, r in top.head(5).iterrows():
     detail = st.session_state["scan_details"].get(r["종목코드"])
+
     if not detail:
         continue
 
@@ -1901,6 +1903,45 @@ with tab1:
         f"{int(rank)}위 · {name} · {rec['판단']} · "
         f"{pattern} · 최종 {score['TotalScore']:.1f}"
     )
+
+    with st.expander(
+        title,
+        expanded=(int(rank) == 1)
+    ):
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "종목 자체",
+            f"{score['QualityScore']:.1f}"
+        )
+
+        c2.metric(
+            "내일 진입",
+            f"{score['EntryScore']:.1f}"
+        )
+
+        c3.metric(
+            "상승 가능성",
+            f"{score['RisePotentialScore']:.1f}"
+        )
+
+        st.markdown("**추천 이유**")
+
+        for reason in rec["추천이유"]:
+            st.write("✅ " + reason)
+
+        st.markdown("**주의할 점**")
+
+        for caution in rec["주의점"]:
+            st.write("⚠️ " + caution)
+
+        if score.get("PastSimilarSamples", 0):
+            st.caption(
+                f"과거 유사상황 {int(score['PastSimilarSamples'])}회 · "
+                f"5일 상승비율 {score.get('PastSimilarWin5', np.nan):.1f}% · "
+                f"평균 5일 수익 {score.get('PastSimilarAvg5', np.nan):+.2f}% · "
+                f"평균 20일 수익 {score.get('PastSimilarAvg20', np.nan):+.2f}%"
+            )
 
     with st.expander(
         title,
