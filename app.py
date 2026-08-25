@@ -48,6 +48,12 @@ DEFAULT_CONFIG = {
 if "config" not in st.session_state:
     st.session_state.config = DEFAULT_CONFIG.copy()
 
+if "scan_results" not in st.session_state:
+    st.session_state.scan_results = None
+
+if "invalid_results" not in st.session_state:
+    st.session_state.invalid_results = None
+
 
 # ============================================================
 # 유틸 및 거래일 계산
@@ -106,25 +112,49 @@ def normalize_columns(df):
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_krx_trading_days(year):
     """지정된 연도의 실제 한국 주식시장 거래일 목록을 반환합니다."""
-    holidays_2026 = {
-        dt.date(2026, 1, 1),   # 신정
-        dt.date(2026, 2, 16),  # 설날 연휴
-        dt.date(2026, 2, 17),  # 설날
-        dt.date(2026, 2, 18),  # 설날 연휴
-        dt.date(2026, 3, 2),   # 삼일절 대체휴일
-        dt.date(2026, 5, 5),   # 어린이날
-        dt.date(2026, 5, 25),  # 부처님오신날 대체휴일
-        dt.date(2026, 9, 24),  # 추석 연휴
-        dt.date(2026, 9, 25),  # 추석
-        dt.date(2026, 9, 28),  # 추석 대체휴일
-        dt.date(2026, 10, 9),  # 한글날
-        dt.date(2026, 12, 25), # 기독탄신일
-        dt.date(2026, 12, 31), # 연말 휴장일
+    # 연도별 주요 음력 명절 및 대체공휴일 정의
+    lunar_holidays = {
+        2025: [
+            dt.date(2025, 1, 28), dt.date(2025, 1, 29), dt.date(2025, 1, 30), # 설날
+            dt.date(2025, 3, 3),   # 삼일절 대체
+            dt.date(2025, 5, 5),   # 어린이날/부처님오신날
+            dt.date(2025, 5, 6),   # 대체휴일
+            dt.date(2025, 10, 6), dt.date(2025, 10, 7), dt.date(2025, 10, 8), # 추석
+        ],
+        2026: [
+            dt.date(2026, 2, 16), dt.date(2026, 2, 17), dt.date(2026, 2, 18), # 설날
+            dt.date(2026, 3, 2),   # 삼일절 대체
+            dt.date(2026, 5, 5),   # 어린이날
+            dt.date(2026, 5, 25),  # 부처님오신날 대체
+            dt.date(2026, 9, 24), dt.date(2026, 9, 25), dt.date(2026, 9, 28), # 추석 및 대체
+        ],
+        2027: [
+            dt.date(2027, 2, 8), dt.date(2027, 2, 9), dt.date(2027, 2, 10), # 설날
+            dt.date(2027, 5, 13),  # 부처님오신날
+            dt.date(2027, 9, 14), dt.date(2027, 9, 15), dt.date(2027, 9, 16), # 추석
+        ]
     }
+
+    # 양력 고정 휴장일
+    fixed_holidays = {
+        dt.date(year, 1, 1),   # 신정
+        dt.date(year, 3, 1),   # 삼일절
+        dt.date(year, 5, 1),   # 근로자의 날
+        dt.date(year, 5, 5),   # 어린이날
+        dt.date(year, 6, 6),   # 현충일
+        dt.date(year, 8, 15),  # 광복절
+        dt.date(year, 10, 3),  # 개천절
+        dt.date(year, 10, 9),  # 한글날
+        dt.date(year, 12, 25), # 성탄절
+        dt.date(year, 12, 31), # 연말 휴장일
+    }
+
+    all_holidays = fixed_holidays.union(set(lunar_holidays.get(year, [])))
+
     start = dt.date(year, 1, 1)
     end = dt.date(year, 12, 31)
     all_days = [start + dt.timedelta(days=x) for x in range((end - start).days + 1)]
-    return [d for d in all_days if d.weekday() < 5 and d not in holidays_2026]
+    return [d for d in all_days if d.weekday() < 5 and d not in all_holidays]
 
 
 def get_next_trading_day(base_date):
@@ -187,8 +217,11 @@ def get_daily_data(code, days=180):
         return pd.DataFrame()
 
     df = normalize_columns(df)
-    df.index = pd.to_datetime(df.index)
-    df = df.reset_index().rename(columns={"index": "Date"})
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+
+    if "Date" not in df.columns:
+        df = df.reset_index().rename(columns={"index": "Date"})
 
     required = ["Date", "Open", "High", "Low", "Close", "Volume"]
     if not all(c in df.columns for c in required):
@@ -201,8 +234,6 @@ def get_daily_data(code, days=180):
         df["Amount"] = df["Close"] * df["Volume"]
 
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
-    
-    # 중복 삭제 전에 validate_daily_data가 감지할 수 있도록 그대로 유지
     df = df.sort_values("Date").reset_index(drop=True)
     return df
 
@@ -210,7 +241,7 @@ def get_daily_data(code, days=180):
 # ============================================================
 # 데이터 품질
 # ============================================================
-def validate_daily_data(df):
+def validate_daily_data(df, cfg):
     issues = []
 
     if df.empty:
@@ -247,7 +278,7 @@ def validate_daily_data(df):
     if future.any():
         issues.append("미래 날짜 데이터")
 
-    enough = len(df) >= st.session_state.config["min_history"]
+    enough = len(df) >= cfg["min_history"]
     if not enough:
         issues.append(f"데이터 부족({len(df)}일)")
 
@@ -331,12 +362,14 @@ def add_features(df):
         x[f"box_bottom_break_{n}"] = below_low.rolling(5).sum()
 
     x["box5_vs_box20"] = x["box_width_5"] / x["box_width_20"]
-    x["low5_slope"] = x["low"].rolling(5).apply(
+
+    # 기존 x["low"], x["high"] 소문자 참조 오류 수정 -> low, high 변수 활용
+    x["low5_slope"] = low.rolling(5).apply(
         lambda z: np.polyfit(np.arange(len(z)), z, 1)[0]
         if np.isfinite(z).all() else np.nan,
         raw=True,
     )
-    x["high5_slope"] = x["high"].rolling(5).apply(
+    x["high5_slope"] = high.rolling(5).apply(
         lambda z: np.polyfit(np.arange(len(z)), z, 1)[0]
         if np.isfinite(z).all() else np.nan,
         raw=True,
@@ -462,7 +495,7 @@ def process_stock(row, cfg):
 
     try:
         df = get_daily_data(code, cfg["lookback_days"])
-        valid, issues = validate_daily_data(df)
+        valid, issues = validate_daily_data(df, cfg)
 
         if not valid:
             return {
@@ -677,15 +710,19 @@ with tabs[0]:
                     progress.progress(i / max(total, 1))
                     status.text(f"분석 중... {i:,} / {total:,}")
 
-            valid_results = [r for r in results if r.get("valid")]
-            invalid_results = [r for r in results if not r.get("valid")]
+            st.session_state.scan_results = [r for r in results if r.get("valid")]
+            st.session_state.invalid_results = [r for r in results if not r.get("valid")]
 
-            result_df = pd.DataFrame(valid_results)
+        # 결과가 세션 상태에 존재하는 경우 출력
+        if st.session_state.scan_results is not None:
+            valid_results = st.session_state.scan_results
+            invalid_results = st.session_state.invalid_results
 
-            if result_df.empty:
+            if not valid_results:
                 st.warning("조건을 만족하는 후보가 없습니다.")
                 st.caption(f"제외/오류 종목: {len(invalid_results):,}")
             else:
+                result_df = pd.DataFrame(valid_results)
                 result_df = result_df.sort_values(
                     ["score", "box_position_20"],
                     ascending=[False, False],
@@ -754,7 +791,7 @@ with tabs[1]:
     st.subheader("🧪 전략 비교 설계")
     st.info(
         "현재 단계에서는 과거 데이터 전체를 자동 다운로드하여 장기간 백테스트하는 기능은 "
-        "아직 분리하지 않았증니다. 다음 단계에서 동일한 특징 생성기를 사용해 시간순 백테스트를 추가합니다."
+        "아직 분리하지 않았습니다. 다음 단계에서 동일한 특징 생성기를 사용해 시간순 백테스트를 추가합니다."
     )
 
     strategy_df = pd.DataFrame({
@@ -801,7 +838,7 @@ with tabs[2]:
         for row in sample.to_dict("records"):
             try:
                 df = get_daily_data(row["Code"], st.session_state.config["lookback_days"])
-                valid, issues = validate_daily_data(df)
+                valid, issues = validate_daily_data(df, st.session_state.config)
                 rows.append({
                     "종목코드": row["Code"],
                     "종목명": row["Name"],
