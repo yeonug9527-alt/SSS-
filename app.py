@@ -50,7 +50,7 @@ if "config" not in st.session_state:
 
 
 # ============================================================
-# 유틸
+# 유틸 및 거래일 계산
 # ============================================================
 def fmt_pct(x, digits=2):
     if pd.isna(x):
@@ -103,6 +103,41 @@ def normalize_columns(df):
     return df.rename(columns={c: mapping.get(c, c) for c in df.columns})
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_krx_trading_days(year):
+    """지정된 연도의 실제 한국 주식시장 거래일 목록을 반환합니다."""
+    holidays_2026 = {
+        dt.date(2026, 1, 1),   # 신정
+        dt.date(2026, 2, 16),  # 설날 연휴
+        dt.date(2026, 2, 17),  # 설날
+        dt.date(2026, 2, 18),  # 설날 연휴
+        dt.date(2026, 3, 2),   # 삼일절 대체휴일
+        dt.date(2026, 5, 5),   # 어린이날
+        dt.date(2026, 5, 25),  # 부처님오신날 대체휴일
+        dt.date(2026, 9, 24),  # 추석 연휴
+        dt.date(2026, 9, 25),  # 추석
+        dt.date(2026, 9, 28),  # 추석 대체휴일
+        dt.date(2026, 10, 9),  # 한글날
+        dt.date(2026, 12, 25), # 기독탄신일
+        dt.date(2026, 12, 31), # 연말 휴장일
+    }
+    start = dt.date(year, 1, 1)
+    end = dt.date(year, 12, 31)
+    all_days = [start + dt.timedelta(days=x) for x in range((end - start).days + 1)]
+    return [d for d in all_days if d.weekday() < 5 and d not in holidays_2026]
+
+
+def get_next_trading_day(base_date):
+    """실제 거래일 목록을 바탕으로 다음 거래일을 반환합니다 (BDay 완전 대체)."""
+    trading_days = get_krx_trading_days(base_date.year)
+    if base_date >= trading_days[-1]:
+        trading_days += get_krx_trading_days(base_date.year + 1)
+    for td in trading_days:
+        if td > base_date:
+            return td
+    return base_date
+
+
 # ============================================================
 # KRX 목록
 # ============================================================
@@ -120,7 +155,6 @@ def get_listing():
     df["Code"] = df[code_col].astype(str).str.zfill(6)
     df["Name"] = df[name_col].astype(str)
 
-    # 일반주 중심 필터
     text = (
         df["Name"].fillna("")
         + " "
@@ -167,7 +201,9 @@ def get_daily_data(code, days=180):
         df["Amount"] = df["Close"] * df["Volume"]
 
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
-    df = df.sort_values("Date").drop_duplicates("Date").reset_index(drop=True)
+    
+    # 중복 삭제 전에 validate_daily_data가 감지할 수 있도록 그대로 유지
+    df = df.sort_values("Date").reset_index(drop=True)
     return df
 
 
@@ -246,23 +282,18 @@ def add_features(df):
     x["drawdown20"] = (close / x["high20"] - 1) * 100
     x["rise_from_low20"] = (close / x["low20"] - 1) * 100
 
-    # 상승일 비율
     x["up_ratio_20"] = (x["ret_1"] > 0).rolling(20).mean() * 100
 
-    # 연속 상승/하락
     direction = np.sign(x["ret_1"].fillna(0))
     groups = (direction != direction.shift()).cumsum()
     streak = direction.groupby(groups).cumcount() + 1
     x["streak"] = streak * direction
 
-    # 갭
     x["gap"] = (x["Open"] / x["Close"].shift(1) - 1) * 100
 
-    # 캔들 위치
     denom = (high - low).replace(0, np.nan)
     x["close_position"] = (close - low) / denom * 100
 
-    # 거래량/거래대금
     x["vol_ma20"] = volume.rolling(20).mean()
     x["vol_ma60"] = volume.rolling(60).mean()
     x["amount_ma20"] = amount.rolling(20).mean()
@@ -278,12 +309,10 @@ def add_features(df):
         (x["vol_ratio20"] >= 1.5) & (x["close_position"] < 50)
     )
 
-    # 변동성
     x["range_pct"] = (high - low) / low * 100
     x["volatility5"] = x["ret_1"].rolling(5).std()
     x["volatility20"] = x["ret_1"].rolling(20).std()
 
-    # 박스권
     for n in [5, 10, 20]:
         bh = high.rolling(n).max()
         bl = low.rolling(n).min()
@@ -295,7 +324,6 @@ def add_features(df):
         x[f"box_width_{n}"] = width * 100
         x[f"box_position_{n}"] = position * 100
 
-        # 최근 3일 종가가 상단 3% 이내인 횟수
         near_top = close >= bh * 0.97
         x[f"box_top_touch_{n}"] = near_top.rolling(5).sum()
 
@@ -314,7 +342,6 @@ def add_features(df):
         raw=True,
     )
 
-    # RSI
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
@@ -347,7 +374,6 @@ def score_latest(x, market_name, cfg):
             "reason": "핵심 특징 결측: " + ", ".join(missing_core),
         }
 
-    # 유동성
     liquidity_ok = (
         pd.notna(r.get("Amount"))
         and r["Amount"] >= cfg["min_trading_value"]
@@ -357,7 +383,6 @@ def score_latest(x, market_name, cfg):
 
     today_ret = r.get("ret_1", np.nan)
 
-    # 오늘 급등 제외
     if pd.notna(today_ret) and today_ret > cfg["max_today_return"]:
         return {
             "valid": False,
@@ -368,28 +393,22 @@ def score_latest(x, market_name, cfg):
     reasons = []
     penalties = []
 
-    # 1. 상대강도는 시장 데이터가 있을 때 추가
-    # 기본 버전에서는 시장지수 컬럼이 없으므로 후속 단계에서 연결.
     if pd.notna(r.get("ret_5")) and r["ret_5"] > 0:
         score += 2
         reasons.append("최근 5일 상승 흐름")
 
-    # 2. 거래대금 증가
     if pd.notna(r.get("amount_5_change")) and r["amount_5_change"] > 0:
         score += 2
         reasons.append("최근 거래대금 증가")
 
-    # 3. 거래량 증가
     if pd.notna(r.get("vol_ratio20")) and r["vol_ratio20"] > 1:
         score += 2
         reasons.append("전일 거래량이 20일 평균 이상")
 
-    # 4. 박스 상단 접근
     if pd.notna(r.get("box_position_20")) and r["box_position_20"] >= 80:
         score += 2
         reasons.append("20일 박스 상단 부근")
 
-    # 5. 변동성 압축
     if (
         pd.notna(r.get("box5_vs_box20"))
         and r["box5_vs_box20"] < 0.75
@@ -397,27 +416,22 @@ def score_latest(x, market_name, cfg):
         score += 2
         reasons.append("최근 5일 박스 폭이 20일보다 좁음")
 
-    # 6. 최근 저점 상승
     if pd.notna(r.get("low5_slope")) and r["low5_slope"] > 0:
         score += 2
         reasons.append("최근 저점 상승")
 
-    # 7. 분배 감점
     if bool(r.get("distribution_day", False)):
         score -= 3
         penalties.append("거래량 급증 후 종가가 고가에서 크게 밀림")
 
-    # 8. 박스 상단 실패
     if pd.notna(r.get("box_top_touch_20")) and r["box_top_touch_20"] >= 3:
         score -= 2
         penalties.append("박스 상단 반복 테스트")
 
-    # 9. 최근 과열
     if pd.notna(r.get("ret_5")) and r["ret_5"] >= 10:
         score -= 2
         penalties.append("최근 5일 상승률 과도")
 
-    # 10. 과도한 이격
     if pd.notna(r.get("disp20")) and r["disp20"] >= 12:
         score -= 3
         penalties.append("20일선 대비 과도한 이격")
@@ -459,6 +473,9 @@ def process_stock(row, cfg):
                 "reason": "; ".join(issues),
             }
 
+        actual_analysis_date = df["Date"].iloc[-1].date()
+        target_date = get_next_trading_day(actual_analysis_date)
+
         feat = add_features(df)
         result = score_latest(feat, market, cfg)
 
@@ -469,10 +486,8 @@ def process_stock(row, cfg):
             "Code": code,
             "Name": name,
             "Market": market,
-            "analysis_date": str(feat.iloc[-1]["Date"].date()),
-            "target_date": str(
-                (feat.iloc[-1]["Date"] + pd.tseries.offsets.BDay(1)).date()
-            ),
+            "analysis_date": str(actual_analysis_date),
+            "target_date": str(target_date),
         })
         return result
 
@@ -511,6 +526,7 @@ with st.sidebar:
             "오늘 +0% 초과 제외",
             "오늘 +3% 초과 제외",
             "오늘 +5% 초과 제외",
+            "오늘 +10% 초과 제외",
         ],
         index=1,
     )
@@ -567,22 +583,34 @@ with st.sidebar:
         st.session_state.config["max_today_return"] = 0.0
     elif exclude_rule.startswith("오늘 +3"):
         st.session_state.config["max_today_return"] = 3.0
-    else:
+    elif exclude_rule.startswith("오늘 +5"):
         st.session_state.config["max_today_return"] = 5.0
+    elif exclude_rule.startswith("오늘 +10"):
+        st.session_state.config["max_today_return"] = 10.0
 
 
 # ============================================================
 # 시간/기준일 표시
 # ============================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_actual_market_date():
+    test_df = fdr.DataReader('069500', NOW_KST.date() - dt.timedelta(days=10))
+    if not test_df.empty:
+        return test_df.index[-1].date()
+    return NOW_KST.date()
+
+ACTUAL_MARKET_DATE = get_actual_market_date()
+NEXT_TRADING_DATE = get_next_trading_day(ACTUAL_MARKET_DATE)
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("🕐 프로그램 실행", NOW_KST.strftime("%Y-%m-%d %H:%M:%S"))
-c2.metric("📅 현재 날짜", NOW_KST.strftime("%Y-%m-%d"))
-c3.metric("📊 분석 기준", "최근 확정 일봉")
-c4.metric("🎯 예측 대상", "다음 거래일")
+c2.metric("📅 프로그램 실행일", NOW_KST.strftime("%Y-%m-%d"))
+c3.metric("📊 실제 분석 기준일", ACTUAL_MARKET_DATE.strftime("%Y-%m-%d"))
+c4.metric("🎯 다음 거래일(예측)", NEXT_TRADING_DATE.strftime("%Y-%m-%d"))
 
 st.info(
-    "현재 버전은 일봉 기준 장 마감 후 분석을 전제로 합니다. "
-    "실행 시각과 실제 시장 데이터 기준일은 별도로 표시합니다."
+    "💡 프로그램 실행일과 시장의 실제 데이터 기준일을 분리하여 표시합니다. "
+    "다음 거래일은 한국거래소(KRX) 실제 휴장일을 반영하여 산출됩니다."
 )
 
 
@@ -605,8 +633,8 @@ with tabs[0]:
 **현재 설정**
 - 최소 거래대금: **{min_amount_eok:.0f}억원**
 - 오늘 상승 제외: **+{st.session_state.config["max_today_return"]:.0f}% 초과**
-- 분석 기준: **{TODAY.isoformat()}**
-- 예측 대상: **다음 거래일**
+- 분석 기준일: **{ACTUAL_MARKET_DATE.isoformat()}**
+- 예측 대상일: **{NEXT_TRADING_DATE.isoformat()}**
 """
     )
 
@@ -700,7 +728,7 @@ with tabs[0]:
                 st.download_button(
                     "📥 결과 CSV 저장",
                     data=csv,
-                    file_name=f"v10_candidates_{TODAY.isoformat()}.csv",
+                    file_name=f"v10_candidates_{ACTUAL_MARKET_DATE.isoformat()}.csv",
                     mime="text/csv",
                 )
 
@@ -726,7 +754,7 @@ with tabs[1]:
     st.subheader("🧪 전략 비교 설계")
     st.info(
         "현재 단계에서는 과거 데이터 전체를 자동 다운로드하여 장기간 백테스트하는 기능은 "
-        "아직 분리하지 않았습니다. 다음 단계에서 동일한 특징 생성기를 사용해 시간순 백테스트를 추가합니다."
+        "아직 분리하지 않았증니다. 다음 단계에서 동일한 특징 생성기를 사용해 시간순 백테스트를 추가합니다."
     )
 
     strategy_df = pd.DataFrame({
